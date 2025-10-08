@@ -15,7 +15,7 @@ namespace {
 
 constexpr int TopK = 2048;
 constexpr int kThreadsPerBlock = 1024;
-constexpr size_t kSmem = 32 * 1024 * sizeof(uint32_t); // 128KB
+constexpr size_t kSmem = 24 * 1024 * sizeof(uint32_t);
 
 struct FastTopKParams {
   const float *__restrict__ input; // [B, input_stride]
@@ -57,14 +57,14 @@ __device__ __forceinline__ auto convert_to_uint32(float x) -> uint32_t {
   return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
 }
 
-__device__ void fast_topk_cuda_tl(const float *__restrict__ input,
-                                  int *__restrict__ index, int length) {
+__device__ void fast_topk_cuda(const float *__restrict__ input,
+                               int *__restrict__ index, int length) {
   // An optimized topk kernel copied from tilelang kernel
   // We assume length > TopK here, or it will crash
   int topk = TopK;
   constexpr auto BLOCK_SIZE = 1024;
   constexpr auto RADIX = 256;
-  constexpr auto SMEM_INPUT_SIZE = kSmem / (2 * sizeof(int));
+  constexpr auto SMEM_INPUT_SIZE = static_cast<int>(kSmem / (2 * sizeof(int)));
 
   alignas(128) __shared__ int s_histogram_buf[2][RADIX + 128];
   alignas(128) __shared__ int s_counter;
@@ -173,7 +173,7 @@ __device__ void fast_topk_cuda_tl(const float *__restrict__ input,
     }
     __syncthreads();
 
-    const auto threshold_bin = s_threshold_bin_id;
+    const auto threshold_bin = static_cast<unsigned>(s_threshold_bin_id);
     topk -= s_histogram[threshold_bin + 1];
 
     if (topk == 0) {
@@ -223,95 +223,95 @@ __device__ void fast_topk_cuda_tl(const float *__restrict__ input,
     }
   }
 }
-
-__global__ __launch_bounds__(kThreadsPerBlock) // topk
-    void topk_kernel(const FastTopKParams params) {
-  const auto &[input, indices, lengths, input_stride] = params;
-  const auto bid = static_cast<uint64_t>(blockIdx.x);
-  const auto length = lengths[bid];
-  const auto indice = indices + bid * TopK;
-  const auto score = input + bid * input_stride;
+__device__ __forceinline__ void
+fast_topk_dispatch(const float *__restrict__ input, int *__restrict__ index,
+                   int length) {
   if (length <= TopK) {
-    return naive_topk_cuda(score, indice, length);
+    naive_topk_cuda(input, index, length);
   } else {
-    return fast_topk_cuda_tl(score, indice, length);
+    fast_topk_cuda(input, index, length);
   }
 }
 
-__global__ __launch_bounds__(kThreadsPerBlock) // decode
+__device__ __forceinline__ void
+fast_topk_transform_dispatch(const float *__restrict__ input, int32_t length,
+                             int32_t *__restrict__ dst_page_table,
+                             const int32_t *__restrict__ src_page_table) {
+  if (length <= TopK) {
+    naive_topk_transform(input, length, dst_page_table, src_page_table);
+  } else {
+    __shared__ int s_indices[TopK];
+    fast_topk_cuda(input, s_indices, length);
+    // copy src[s_indices] to dst, we manually unroll here
+    static_assert(TopK % kThreadsPerBlock == 0);
+    static_assert(TopK / kThreadsPerBlock == 2);
+    const auto tid = threadIdx.x;
+    const auto idx_0 = tid;
+    const auto pos_0 = s_indices[idx_0];
+    dst_page_table[idx_0] = src_page_table[pos_0];
+    const auto idx_1 = tid + kThreadsPerBlock;
+    const auto pos_1 = s_indices[idx_1];
+    dst_page_table[idx_1] = src_page_table[pos_1];
+  }
+}
+
+__global__ __launch_bounds__(kThreadsPerBlock, 2) // topk
+    void topk_kernel(const FastTopKParams params) {
+  const auto &[input, indices, lengths, input_stride] = params;
+  const auto bid = blockIdx.x;
+  const auto length = lengths[bid];
+  const auto indice = indices + bid * static_cast<int64_t>(TopK);
+  const auto score = input + bid * input_stride;
+  return fast_topk_dispatch(score, indice, length);
+}
+
+__global__ __launch_bounds__(kThreadsPerBlock, 2) // decode
     void topk_transform_decode_kernel(
         const FastTopKParams params, int32_t *__restrict__ dst_page_table,
         const int32_t *__restrict__ src_page_table, const int64_t src_stride) {
   const auto &[input, _, lengths, input_stride] = params;
-  const auto bid = static_cast<uint64_t>(blockIdx.x);
-  const auto tid = threadIdx.x;
+  const auto bid = blockIdx.x;
   const auto length = lengths[bid];
   const auto src_page_entry = src_page_table + bid * src_stride;
-  const auto dst_page_entry = dst_page_table + bid * TopK;
+  const auto dst_page_entry = dst_page_table + bid * static_cast<int64_t>(TopK);
   const auto score = input + bid * input_stride;
-  if (length <= TopK) {
-    return naive_topk_transform(score, length, dst_page_entry, src_page_entry);
-  } else {
-    __shared__ int s_indices[TopK];
-    fast_topk_cuda_tl(score, s_indices, length);
-    // copy src[s_indices] to dst, we manually unroll here
-    static_assert(TopK % kThreadsPerBlock == 0);
-    static_assert(TopK / kThreadsPerBlock == 2);
-    const auto idx_0 = tid;
-    const auto pos_0 = s_indices[idx_0];
-    dst_page_entry[idx_0] = src_page_entry[pos_0];
-    const auto idx_1 = tid + kThreadsPerBlock;
-    const auto pos_1 = s_indices[idx_1];
-    dst_page_entry[idx_1] = src_page_entry[pos_1];
-  }
+  return fast_topk_transform_dispatch(score, length, dst_page_entry,
+                                      src_page_entry);
 }
 
-__global__ __launch_bounds__(kThreadsPerBlock) // prefill
+__global__ __launch_bounds__(kThreadsPerBlock, 2) // prefill
     void topk_transform_prefill_kernel(
         const FastTopKParams params, int32_t *__restrict__ dst_page_table,
         const int32_t *__restrict__ src_page_table, const int64_t src_stride,
         const int32_t *__restrict__ cu_seqlens_q, const int64_t prefill_bs) {
   const auto &[input, _, lengths, input_stride] = params;
-  const auto bid = static_cast<uint64_t>(blockIdx.x);
+  const auto bid = blockIdx.x;
   const auto tid = threadIdx.x;
   const auto length = lengths[bid];
-  const auto dst_page_entry = dst_page_table + bid * TopK;
+  const auto dst_page_entry = dst_page_table + bid * static_cast<int64_t>(TopK);
   const auto score = input + bid * input_stride;
 
-  /// NOTE: prefill bs is usually small, we can just use a simple loop here
-  /// We ensure that last cu_seqlens is equal to number of blocks launched
+  /// NOTE: We ensure that last cu_seqlens is equal to number of blocks launched
   __shared__ const int32_t *s_src_page_entry;
   if (C10_LIKELY(prefill_bs <= kThreadsPerBlock)) {
     if (tid < prefill_bs) {
-      if (bid >= cu_seqlens_q[tid] && bid < cu_seqlens_q[tid + 1]) {
+      if (bid >= static_cast<uint32_t>(cu_seqlens_q[tid]) &&
+          bid < static_cast<uint32_t>(cu_seqlens_q[tid + 1])) {
         s_src_page_entry = src_page_table + tid * src_stride;
       }
     }
   } else {
     for (int64_t i = tid; i < prefill_bs; i += kThreadsPerBlock) {
-      if (bid >= cu_seqlens_q[i] && bid < cu_seqlens_q[i + 1]) {
-        s_src_page_entry = src_page_table + i * src_stride;
+      if (bid >= static_cast<uint32_t>(cu_seqlens_q[i]) &&
+          bid < static_cast<uint32_t>(cu_seqlens_q[i + 1])) {
+        s_src_page_entry = src_page_table + tid * src_stride;
       }
     }
   }
   __syncthreads();
   const auto src_page_entry = s_src_page_entry;
-
-  if (length <= TopK) {
-    return naive_topk_transform(score, length, dst_page_entry, src_page_entry);
-  } else {
-    __shared__ int s_indices[TopK];
-    fast_topk_cuda_tl(score, s_indices, length);
-    // copy src[s_indices] to dst, we manually unroll here
-    static_assert(TopK % kThreadsPerBlock == 0);
-    static_assert(TopK / kThreadsPerBlock == 2);
-    const auto idx_0 = tid;
-    const auto pos_0 = s_indices[idx_0];
-    dst_page_entry[idx_0] = src_page_entry[pos_0];
-    const auto idx_1 = tid + kThreadsPerBlock;
-    const auto pos_1 = s_indices[idx_1];
-    dst_page_entry[idx_1] = src_page_entry[pos_1];
-  }
+  return fast_topk_transform_dispatch(score, length, dst_page_entry,
+                                      src_page_entry);
 }
 
 auto get_params(at::Tensor score, at::Tensor lengths,

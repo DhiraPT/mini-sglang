@@ -3,15 +3,6 @@ from minisgl.kernel import fast_topk, fast_topk_transform
 from minisgl.utils import call_if_main
 
 
-def _fast_topk(
-    score: torch.Tensor,
-    indices: torch.Tensor,
-    lengths: torch.Tensor,
-):
-    fast_topk(score, indices, lengths)
-    return indices
-
-
 def _torch_topk(
     score: torch.Tensor,
     clip: int,
@@ -28,12 +19,11 @@ def _torch_topk(
 @call_if_main(__name__)
 def test_fast_topk():
     torch.manual_seed(0)
-    B = 132
-    clip = 16384
+    B = 132 * 3 + 2
+    clip = 8192 * 8
     stream = torch.cuda.Stream()
     torch.cuda.set_stream(stream)
-    score = torch.randn(B, 100000, dtype=torch.float32, device="cuda")
-    score *= pow(2.0, 15)
+    score = torch.randn(B, 1310172, dtype=torch.float32, device="cuda")
     indices = torch.full((B, 2048), -2, dtype=torch.int32, device="cuda")
     lengths = torch.full((B,), clip, dtype=torch.int32, device="cuda")
     fast_topk(score, indices, lengths)
