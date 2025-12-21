@@ -134,12 +134,13 @@ class RadixCacheManager(BaseCacheManager):
 
     def insert_prefix(self, input_ids: torch.Tensor, indices: torch.Tensor) -> int:
         expanded_indices = torch.repeat_interleave(indices, self.page_size)
-        expanded_input = torch.repeat_interleave(input_ids, self.page_size)
-        node, prefix_len = self._walk(expanded_input)
-        assert prefix_len <= len(expanded_input)
-        if prefix_len < len(expanded_input):
+        aligned_len = len(expanded_indices)
+        aligned_input = input_ids[:aligned_len]
+        node, prefix_len = self._walk(aligned_input)
+        assert prefix_len <= len(aligned_input)
+        if prefix_len < len(aligned_input):
             new_node = RadixTreeNode()
-            new_node.set_key_value(expanded_input[prefix_len:], expanded_indices[prefix_len:])
+            new_node.set_key_value(aligned_input[prefix_len:], expanded_indices[prefix_len:])
             new_node.set_parent(node)
             self.evictable_size += new_node.length // self.page_size
         return prefix_len // self.page_size
