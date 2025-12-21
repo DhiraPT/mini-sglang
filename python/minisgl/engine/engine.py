@@ -77,7 +77,7 @@ class Engine:
             self.page_table,
         )
         self.ctx = Context(
-            page_size=1,
+            page_size=config.page_size,
             kv_cache=self.kv_cache,
             attn_backend=self.attn_backend,
             page_table=self.page_table,
