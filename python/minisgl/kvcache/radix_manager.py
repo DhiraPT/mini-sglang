@@ -104,14 +104,14 @@ class RadixCacheManager(BaseCacheManager):
                 node.ref_count -= 1
                 assert node.ref_count > 0
                 if node.ref_count == 0:
-                    self.evictable_size += node.length
-                    self.protected_size -= node.length
+                    self.evictable_size += node.length // self.page_size
+                    self.protected_size -= node.length // self.page_size
         else:
             while not node.is_root():
                 node = node.parent
                 if node.ref_count == 0:
-                    self.evictable_size -= node.length
-                    self.protected_size += node.length
+                    self.evictable_size -= node.length // self.page_size
+                    self.protected_size += node.length // self.page_size
                 node.ref_count += 1
 
     def match_prefix(self, input_ids: torch.Tensor) -> Tuple[RadixCacheHandle, torch.Tensor]:
