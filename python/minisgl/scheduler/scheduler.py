@@ -179,10 +179,19 @@ class Scheduler(SchedulerIOMixin):
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         needed_size = sum(r.extend_len for r in batch.reqs)
-        batch.out_loc = self.cache_manager.allocate(needed_size)
+        allocated_pages = self.cache_manager.allocate(needed_size)
+        page_size = self.engine.config.page_size
+        if page_size == 1:
+            batch.out_loc = allocated_pages
+        else:
+            pages_expanded = allocated_pages.repeat_interleave(page_size)
+            offsets = torch.arange(page_size, device=self.device).tile(len(allocated_pages))
+            batch.out_loc = (pages_expanded * page_size) + offsets
+            batch.out_loc = batch.out_loc[:needed_size]
         # NOTE: Pad the batch if needed
         if padding_size := self.engine.graph_runner.pad_batch(batch):
-            batch.out_loc = F.pad(batch.out_loc, (0, padding_size), value=self.engine.dummy_page)
+            dummy_slot = self.engine.dummy_page * page_size
+            batch.out_loc = F.pad(batch.out_loc, (0, padding_size), value=dummy_slot)
         # NOTE: prepare 2d indices for token ids loading and writing
         load_indices = _make_2d_indices(
             self.token_pool, [(r.table_idx, r.cached_len, r.device_len) for r in batch.padded_reqs]
@@ -190,8 +199,21 @@ class Scheduler(SchedulerIOMixin):
         write_indices = _make_2d_indices(
             self.token_pool, [(r.table_idx, r.device_len, r.device_len + 1) for r in batch.reqs]
         )
-        # NOTE: write out_loc to page_table before `prepare_metadata`
-        self.page_table.view(-1)[load_indices] = batch.out_loc
+        page_table_ranges = []
+        for r in batch.reqs:
+            total_tokens = r.cached_len + r.extend_len
+            start_page = r.cached_len // page_size
+            end_page = (total_tokens + page_size - 1) // page_size
+            if end_page > start_page:
+                page_table_ranges.append((r.table_idx, start_page, end_page))
+        # NOTE: write allocated_pages to page_table before `prepare_metadata`
+        if page_table_ranges:
+            pt_update_indices = _make_2d_indices(self.page_table, page_table_ranges)
+            if len(pt_update_indices) != len(allocated_pages):
+                min_len = min(len(pt_update_indices), len(allocated_pages))
+                self.page_table.view(-1)[pt_update_indices[:min_len]] = allocated_pages[:min_len]
+            else:
+                self.page_table.view(-1)[pt_update_indices] = allocated_pages
         self.engine.attn_backend.prepare_metadata(batch)
         return ForwardInput(
             batch=batch,

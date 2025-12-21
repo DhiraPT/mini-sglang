@@ -28,8 +28,7 @@ class CacheManager:
 
     @property
     def available_size(self) -> int:
-        total_pages = self.manager.size_info.evictable_size + len(self._free_slots)
-        return total_pages * self.page_size
+        return self.manager.size_info.evictable_size + len(self._free_slots) * self.page_size
 
     def lock(self, handle: BaseCacheHandle) -> None:
         self.manager.lock_handle(handle, unlock=False)

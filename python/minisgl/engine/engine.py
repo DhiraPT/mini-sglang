@@ -66,8 +66,9 @@ class Engine:
         )
         # NOTE: make page table 128 aligned (32 * sizeof(int32) == 128 bytes)
         self.max_seq_len = _align_up_32(min(config.max_seq_len, self.num_pages))
+        self.max_num_pages = (config.max_seq_len + config.page_size - 1)
         self.page_table = create_page_table(  # + 1 for dummy request
-            (config.max_running_req + 1, self.max_seq_len),
+            (config.max_running_req + 1, self.max_num_pages),
             device=self.device,
         )
         self.attn_backend = create_attention_backend(
