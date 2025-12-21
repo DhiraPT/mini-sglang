@@ -62,6 +62,7 @@ class Engine:
             head_dim=self.model_config.head_dim,
             device=self.device,
             dtype=self.dtype,
+            page_size=config.page_size,
         )
         # NOTE: make page table 128 aligned (32 * sizeof(int32) == 128 bytes)
         self.max_seq_len = _align_up_32(min(config.max_seq_len, self.num_pages))

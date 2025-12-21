@@ -24,6 +24,7 @@ def create_kvcache(
     device: torch.device,
     cache_layout: KVCacheLayout = KVCacheLayout.LayerFirst,
     cache_type: KVCacheType = KVCacheType.MHA,
+    page_size: int = 1,
 ) -> BaseKVCache:
     from .mha_pool import MHAKVCache
 
@@ -37,6 +38,7 @@ def create_kvcache(
                 head_dim=head_dim,
                 device=device,
                 dtype=dtype,
+                page_size=page_size,
             )
     raise ValueError(f"Unsupported KVCacheType: {cache_type}")
 
