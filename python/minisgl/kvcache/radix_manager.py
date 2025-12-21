@@ -104,33 +104,36 @@ class RadixCacheManager(BaseCacheManager):
                 node.ref_count -= 1
                 assert node.ref_count > 0
                 if node.ref_count == 0:
-                    self.evictable_size += node.length // self.page_size
-                    self.protected_size -= node.length // self.page_size
+                    self.evictable_size += node.length
+                    self.protected_size -= node.length
         else:
             while not node.is_root():
                 node = node.parent
                 if node.ref_count == 0:
-                    self.evictable_size -= node.length // self.page_size
-                    self.protected_size += node.length // self.page_size
+                    self.evictable_size -= node.length
+                    self.protected_size += node.length
                 node.ref_count += 1
 
     def match_prefix(self, input_ids: torch.Tensor) -> Tuple[RadixCacheHandle, torch.Tensor]:
-        truncated_len = (len(input_ids) // self.page_size) * self.page_size
-        if truncated_len == 0:
+        node, prefix_len = self._walk(input_ids)
+        # Align the match length down to the nearest page boundary
+        valid_page_count = prefix_len // self.page_size
+        valid_len = valid_page_count * self.page_size
+        if valid_len == 0:
             return RadixCacheHandle(0, self.root_node), self.empty_tensor
-        truncated_input = input_ids[:truncated_len]
-        node, prefix_len = self._walk(truncated_input)
-        if prefix_len == 0:
-            assert node.is_root() and node is self.root_node
-            return RadixCacheHandle(prefix_len, node), self.empty_tensor
-        value_list: List[torch.Tensor] = []
-        while not node.is_root():
-            value_list.append(node.value)
+        # Backtrack if the node we ended up at is "deeper" than our valid_len
+        while not node.is_root() and (node.parent.length if not node.parent.is_root() else 0) >= valid_len:
             node = node.parent
+        value_list: List[torch.Tensor] = []
+        curr = node
+        while not curr.is_root():
+            value_list.append(curr.value)
+            curr = curr.parent
         value_list.reverse()
         all_indices = torch.cat(value_list)
-        page_indices = all_indices[::self.page_size]
-        return RadixCacheHandle(prefix_len, node), page_indices
+        relevant_indices = all_indices[:valid_len]
+        page_indices = relevant_indices[::self.page_size]
+        return RadixCacheHandle(valid_len, node), page_indices
 
     def insert_prefix(self, input_ids: torch.Tensor, indices: torch.Tensor) -> int:
         expanded_indices = torch.repeat_interleave(indices, self.page_size)
@@ -142,8 +145,8 @@ class RadixCacheManager(BaseCacheManager):
             new_node = RadixTreeNode()
             new_node.set_key_value(aligned_input[prefix_len:], expanded_indices[prefix_len:])
             new_node.set_parent(node)
-            self.evictable_size += new_node.length // self.page_size
-        return prefix_len // self.page_size
+            self.evictable_size += new_node.length
+        return len(aligned_input) // self.page_size
 
     def _walk(self, input_ids: torch.Tensor) -> Tuple[RadixTreeNode, int]:
         prefix_len = 0
@@ -172,28 +175,29 @@ class RadixCacheManager(BaseCacheManager):
 
         return node, prefix_len
 
-    def evict(self, size: int) -> torch.Tensor:
-        if size == 0:
+    def evict(self, num_pages: int) -> torch.Tensor:
+        if num_pages == 0:
             return self.empty_tensor
+        num_tokens_to_evict = num_pages * self.page_size
         assert (
-            size <= self.evictable_size
-        ), f"Cannot evict {size}, only {self.evictable_size} is evictable"
+            num_tokens_to_evict <= self.evictable_size
+        ), f"Cannot evict {num_pages} pages ({num_tokens_to_evict} tokens), only {self.evictable_size} tokens evictable"
 
         leave_nodes = self._collect_leave_nodes_for_evict()
         heapq.heapify(leave_nodes)
         evicted_indices: List[torch.Tensor] = []
-        evicted_size = 0
+        num_evicted = 0
 
-        while evicted_size < size:
+        while num_evicted < num_tokens_to_evict:
             assert (
                 leave_nodes
-            ), f"Cannot evict enough cache, need {size}, only {evicted_size} evicted"
+            ), f"Cannot evict enough cache, need {num_tokens_to_evict}, only {num_evicted} evicted"
             node = heapq.heappop(leave_nodes)
             assert node.ref_count == 0 and node.is_leaf() and not node.is_root()
-            evicted_size += node.length // self.page_size
+            num_evicted += node.length
             page_indices = node.value[::self.page_size]
             evicted_indices.append(page_indices)
-            self.evictable_size -= node.length // self.page_size
+            self.evictable_size -= node.length
             parent = node.parent
             del parent.children[int(node._key[0].item())]
             # NOTE: root is always protected, so won't be evicted
