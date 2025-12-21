@@ -28,8 +28,7 @@ class CacheManager:
 
     @property
     def available_size(self) -> int:
-        total_tokens = self.manager.size_info.evictable_size + len(self._free_slots) * self.page_size
-        return total_tokens // self.page_size
+        return self.manager.size_info.evictable_size + len(self._free_slots)
 
     def lock(self, handle: BaseCacheHandle) -> None:
         self.manager.lock_handle(handle, unlock=False)
@@ -38,13 +37,15 @@ class CacheManager:
         self.manager.lock_handle(handle, unlock=True)
 
     def allocate(self, needed_len: int) -> torch.Tensor:
+        needed_pages = (needed_len + self.page_size - 1) // self.page_size
         if needed_len <= (free_len := len(self._free_slots)):
-            allocated = self._free_slots[:needed_len]
-            self._free_slots = self._free_slots[needed_len:]
+            allocated = self._free_slots[:needed_pages]
+            self._free_slots = self._free_slots[needed_pages:]
             return allocated
 
-        # NOTE: len(evicted) + free_len >= needed_len
-        evicted = self.manager.evict((needed_len - free_len) * self.page_size)
+        # NOTE: len(evicted) + free_len >= needed_pages
+        pages_to_evict = needed_pages - free_len
+        evicted = self.manager.evict(pages_to_evict)
         merged = torch.cat([self._free_slots, evicted])
         assert len(merged) >= needed_len, "Eviction did not free enough space."
 
