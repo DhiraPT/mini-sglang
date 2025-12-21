@@ -85,8 +85,9 @@ class RadixCacheHandle(BaseCacheHandle):
 
 
 class RadixCacheManager(BaseCacheManager):
-    def __init__(self, device: torch.device):
+    def __init__(self, device: torch.device, page_size: int = 1):
         self.device = device
+        self.page_size = page_size
         self.empty_tensor = torch.empty(0, dtype=torch.int32, device=device)
         super().__init__()
         self.root_node = RadixTreeNode()
@@ -114,26 +115,34 @@ class RadixCacheManager(BaseCacheManager):
                 node.ref_count += 1
 
     def match_prefix(self, input_ids: torch.Tensor) -> Tuple[RadixCacheHandle, torch.Tensor]:
-        node, prefix_len = self._walk(input_ids)
+        truncated_len = (len(input_ids) // self.page_size) * self.page_size
+        if truncated_len == 0:
+            return RadixCacheHandle(0, self.root_node), self.empty_tensor
+        truncated_input = input_ids[:truncated_len]
+        node, prefix_len = self._walk(truncated_input)
         if prefix_len == 0:
-            assert node.is_root() and node is self.root_node and prefix_len == 0
+            assert node.is_root() and node is self.root_node
             return RadixCacheHandle(prefix_len, node), self.empty_tensor
         value_list: List[torch.Tensor] = []
         while not node.is_root():
             value_list.append(node.value)
             node = node.parent
         value_list.reverse()
-        return RadixCacheHandle(prefix_len, node), torch.cat(value_list)
+        all_indices = torch.cat(value_list)
+        page_indices = all_indices[::self.page_size]
+        return RadixCacheHandle(prefix_len, node), page_indices
 
     def insert_prefix(self, input_ids: torch.Tensor, indices: torch.Tensor) -> int:
-        node, prefix_len = self._walk(input_ids)
-        assert prefix_len <= len(input_ids)
-        if prefix_len < len(input_ids):
+        expanded_indices = torch.repeat_interleave(indices, self.page_size)
+        expanded_input = torch.repeat_interleave(input_ids, self.page_size)
+        node, prefix_len = self._walk(expanded_input)
+        assert prefix_len <= len(expanded_input)
+        if prefix_len < len(expanded_input):
             new_node = RadixTreeNode()
-            new_node.set_key_value(input_ids[prefix_len:], indices[prefix_len:])
+            new_node.set_key_value(expanded_input[prefix_len:], expanded_indices[prefix_len:])
             new_node.set_parent(node)
-            self.evictable_size += new_node.length
-        return prefix_len
+            self.evictable_size += new_node.length // self.page_size
+        return prefix_len // self.page_size
 
     def _walk(self, input_ids: torch.Tensor) -> Tuple[RadixTreeNode, int]:
         prefix_len = 0
@@ -180,16 +189,17 @@ class RadixCacheManager(BaseCacheManager):
             ), f"Cannot evict enough cache, need {size}, only {evicted_size} evicted"
             node = heapq.heappop(leave_nodes)
             assert node.ref_count == 0 and node.is_leaf() and not node.is_root()
-            evicted_size += node.length
-            evicted_indices.append(node.value)
-            self.evictable_size -= node.length
+            evicted_size += node.length // self.page_size
+            page_indices = node.value[::self.page_size]
+            evicted_indices.append(page_indices)
+            self.evictable_size -= node.length // self.page_size
             parent = node.parent
             del parent.children[int(node._key[0].item())]
             # NOTE: root is always protected, so won't be evicted
             if parent.is_leaf() and parent.ref_count == 0:
                 heapq.heappush(leave_nodes, parent)
 
-        return torch.cat(evicted_indices)
+        return torch.cat(evicted_indices) if evicted_indices else self.empty_tensor
 
     def _collect_leave_nodes_for_evict(self) -> List[RadixTreeNode]:
         nodes: List[RadixTreeNode] = [self.root_node]
